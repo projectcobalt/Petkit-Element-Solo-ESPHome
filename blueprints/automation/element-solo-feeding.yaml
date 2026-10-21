@@ -1,17 +1,18 @@
 blueprint:
   name: Element Solo - Scheduled Feeding and Supervision
-  description: 'Version 1.2.0.
+  description: 'Version 2.0.0.
 
     Schedule and supervise one ESPHome Element Solo feeder. Create one
-    automation from this blueprint for each feeder, or multiple automations for the
-    same feeder when different schedules require different portion counts.
+    automation from this blueprint per feeder and put all its schedules here.
+    The feeder owns low-food checks and reminder timing. This blueprint forwards
+    its food_refill_needed events to the existing error-notification targets.
 
     '
   domain: automation
   author: projectcobalt
   source_url: https://github.com/projectcobalt/Petkit-Element-Solo/blob/main/blueprints/automation/element-solo-feeding.yaml
   homeassistant:
-    min_version: 2024.10.0
+    min_version: 2026.7.0
   input:
     feeder:
       name: Feeder
@@ -20,12 +21,18 @@ blueprint:
       input:
         feeder_device:
           name: Feeder device
-          description: Select the adopted ESPHome/Fleet Element Solo feeder to schedule and supervise. The blueprint discovers its entities automatically; keep their default entity ID suffixes.
+          description: Select the Element Solo feeder device that owns the Feed Now entity. The blueprint discovers its entities automatically; keep their default entity ID suffixes.
           selector:
             device:
               filter:
-              - integration: esphome_fleet
+              - model: petkit-element-solo
               multiple: false
+        native_feed_action:
+          name: Native feed action
+          description: 'Optional ESPHome action identifier, for example esphome.element_solo_abcdef_feed. Leave empty to retain legacy button feeding.'
+          default: ''
+          selector:
+            text: {}
     schedule:
       name: Schedule
       icon: mdi:calendar-clock
@@ -62,8 +69,7 @@ blueprint:
           default:
             minutes: 2
           selector:
-            duration:
-              enable_second: true
+            duration: {}
     warnings:
       name: Warning thresholds
       icon: mdi:alert-outline
@@ -86,8 +92,7 @@ blueprint:
           default:
             minutes: 5
           selector:
-            duration:
-              enable_second: true
+            duration: {}
     notifications:
       name: Notifications
       icon: mdi:bell-outline
@@ -104,7 +109,6 @@ blueprint:
               - domain:
                 - notify
               multiple: true
-              reorder: false
         warning_notify_targets:
           name: Power warning notification targets
           description: Notify these targets for DC loss or low battery warnings.
@@ -115,7 +119,6 @@ blueprint:
               - domain:
                 - notify
               multiple: true
-              reorder: false
         success_notify_targets:
           name: Success notification targets
           description: Optionally notify these targets after a verified feed.
@@ -126,12 +129,14 @@ blueprint:
               - domain:
                 - notify
               multiple: true
-              reorder: false
-mode: single
+# Keep short alert runs independent of scheduled-feed confirmation waits.
+mode: parallel
+max: 20
 max_exceeded: silent
 trigger_variables:
   feeder_device: !input feeder_device
   low_battery_voltage: !input low_battery_voltage
+  native_feed_action: !input native_feed_action
 variables:
   feeder_device: !input feeder_device
   feeder_name: '{{ device_attr(feeder_device, ''name_by_user'') or device_attr(feeder_device,
@@ -157,8 +162,19 @@ variables:
   success_notify_targets: !input success_notify_targets
   feed_portions: !input feed_portions
   low_battery_voltage: !input low_battery_voltage
+  native_feed_action: !input native_feed_action
+  low_food_threshold: "{{ device_entities(feeder_device) | select('match', '^number\\..*_low_food_threshold$') | list | first | default('') }}"
+  estimated_food_remaining: "{{ device_entities(feeder_device) | select('match', '^sensor\\..*_estimated_food_remaining$') | list | first | default('') }}"
 triggers:
 - triggers: !input schedule_triggers
+# Native event trigger listens only to the selected device; no HA timing helper.
+- trigger: event.received
+  target:
+    device_id: !input feeder_device
+  options:
+    event_type:
+      - food_refill_needed
+  id: food_refill_needed
 - trigger: template
   value_template: >-
     {% set battery_power_active = device_entities(feeder_device)
@@ -194,7 +210,34 @@ triggers:
        state_attr(feeder_event, 'event_type') == 'feed_rejected' else false }}
   id: feeder_rejected
 actions:
+# Preserve the former single-mode admission for legacy feeding and global
+# outcome alerts. This is a conservative compatibility gate, not a mutex.
+- condition: template
+  value_template: >-
+    {{ this.attributes.current | int(0) == 0 or
+       (trigger is defined and trigger.id in
+        ['food_refill_needed']) or
+       (native_feed_action != '' and
+        (trigger is not defined or trigger.id not in ['feeder_jammed', 'feeder_rejected'])) }}
 - choose:
+  - conditions:
+    - condition: trigger
+      id: food_refill_needed
+    sequence:
+    - condition: template
+      value_template: '{{ error_notify_targets | count > 0 }}'
+    - action: notify.send_message
+      target:
+        entity_id: !input error_notify_targets
+      data:
+        title: '{{ feeder_name }} refill needed'
+        message: >-
+          {{ feeder_name }} requests a food refill.
+          {% if is_number(states(estimated_food_remaining)) and is_number(states(low_food_threshold)) %}
+          Estimated food remaining: {{ states(estimated_food_remaining) | float | round(1) }} g;
+          refill threshold: {{ states(low_food_threshold) | float | round(1) }} g.
+          {% endif %}
+          Refill the hopper and record the refill on the feeder.
   - conditions:
     - condition: trigger
       id: battery_power
@@ -334,23 +377,47 @@ actions:
               title: '{{ notification_title }}'
               message: '{{ notification_message }}'
       - stop: Feeder is jammed
-  - action: number.set_value
-    target:
-      entity_id: '{{ feed_portions_entity }}'
-    data:
-      value: '{{ feed_portions | int }}'
   - variables:
       previous_feeder_event_state: '{{ states(feeder_event) if feeder_event != ''''
         else '''' }}'
-  - action: button.press
-    target:
-      entity_id: '{{ feed_now }}'
-    continue_on_error: true
+      feed_acceptance: {}
+  - choose:
+    - conditions: '{{ native_feed_action != "" }}'
+      sequence:
+      - action: '{{ native_feed_action }}'
+        data:
+          portions: '{{ feed_portions | int }}'
+        response_variable: feed_acceptance
+        continue_on_error: true
+      - choose:
+        - conditions: '{{ feed_acceptance is not mapping or not feed_acceptance.get("accepted", false) }}'
+          sequence:
+          - choose:
+            - conditions: '{{ error_notify_targets | count > 0 }}'
+              sequence:
+              - action: notify.send_message
+                target:
+                  entity_id: !input error_notify_targets
+                data:
+                  title: '{{ feeder_name }} feed not accepted or confirmed'
+                  message: '{{ feeder_name }} did not confirm acceptance of the scheduled request for {{ feed_portions | int }} portions. The feeder may be busy, may have rejected the request, or its connection may have failed. Check its state and last feed before retrying; no automatic retry was started.'
+                continue_on_error: true
+          - stop: Native feed request was not accepted; no outcome waiter is started
+    default:
+    - action: number.set_value
+      target:
+        entity_id: '{{ feed_portions_entity }}'
+      data:
+        value: '{{ feed_portions | int }}'
+    - action: button.press
+      target:
+        entity_id: '{{ feed_now }}'
+      continue_on_error: true
   - wait_for_trigger:
     - trigger: template
       value_template: "{{ feeder_event != '' and\n   states(feeder_event) != previous_feeder_event_state
         and\n   state_attr(feeder_event, 'event_type') in\n   ['feed_completed',
-        'feed_jammed', 'feed_rejected'] }}"
+         'feed_jammed'] + (['feed_rejected'] if native_feed_action == '' else []) }}"
     timeout: !input completion_timeout
     continue_on_timeout: true
   - variables:

@@ -14,19 +14,21 @@ substitutions:
   motor_pulse_lockout_ms: "500"
   time_zone: "Australia/Brisbane"
   sound_feed_start: "start:d=16,o=6,b=100:e,g"
+  sound_feed_low_food: "lowfood:d=8,o=5,b=120:g,p,e,p,c"
   sound_feed_done: "done:d=16,o=6,b=100:g,e"
   sound_jam_recover: "jam:d=16,o=5,b=100:c,e,c"
   sound_jammed: "jammed:d=8,o=5,b=100:c,c,c"
   sound_wifi: "wifi:d=16,o=6,b=100:e"
 
 esphome:
+  min_version: 2026.9.1
   name: ${name}
   friendly_name: ${friendly_name}
   name_add_mac_suffix: true
   comment: "${manufacturer} Fresh Element Solo feeder, model ${model}, product code ${product_code}"
   project:
     name: projectcobalt.petkit-element-solo
-    version: "1.2.0"
+    version: "2.0.0"
   on_boot:
     priority: 800
     then:
@@ -67,6 +69,7 @@ dashboard_import:
   import_full_config: false
   
 api:
+  id: feeder_api
   actions:
     - action: feed
       variables:
@@ -109,6 +112,7 @@ api:
                           root["accepted"] = true;
                           root["portions"] = portions;
 
+
 ota:
   - platform: web_server
   - platform: esphome
@@ -143,6 +147,14 @@ time:
     address: 0x51
     timezone: ${time_zone}
     update_interval: never
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 9
+        then:
+          - script.execute:
+              id: check_food_warning
+              reminder: true
 
   - platform: sntp
     id: sntp_time
@@ -206,6 +218,14 @@ light:
               duration: 500ms
 
 event:
+  # Refill requests are separate from feed outcomes so they cannot wake a meal waiter.
+  - platform: template
+    id: food_reserve_event
+    name: Food Reserve Event
+    icon: mdi:food
+    event_types:
+      - food_refill_needed
+
   - platform: template
     id: feeder_event
     name: Feeder Event
@@ -218,6 +238,50 @@ event:
       - feed_jammed
 
 globals:
+  - id: reserve_capacity
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_calibration
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_threshold
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_remaining
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_total
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_since_refill
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: reserve_known
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: reserve_threshold_initialized
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  # Warning timing belongs to the device, including across reboots.
+  - id: reserve_warning_sent
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: reserve_last_warning
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: feed_calibration
+    type: float
+    initial_value: "0"
   - id: target_scoops
     type: int
     initial_value: "0"
@@ -256,6 +320,121 @@ globals:
     max_restore_data_length: 24
 
 script:
+  - id: check_food_warning
+    parameters:
+      reminder: bool
+    then:
+      - lambda: |-
+          const bool low = id(reserve_known) && id(reserve_capacity) > 0 &&
+              id(reserve_calibration) > 0 && id(reserve_remaining) <= id(reserve_threshold);
+          if (!low) {
+            if (id(reserve_warning_sent) || id(reserve_last_warning) != 0) {
+              id(reserve_warning_sent) = false;
+              id(reserve_last_warning) = 0;
+              id(checkpoint_food_reserve).execute();
+            }
+            return;
+          }
+          const auto now = id(rtc_time).now();
+          // An initial warning can work without valid time. Once time recovers,
+          // anchor its reminder clock without sending the same warning again.
+          if (id(reserve_warning_sent)) {
+            if (!now.is_valid()) return;
+            if (id(reserve_last_warning) == 0) {
+              id(reserve_last_warning) = now.timestamp;
+              id(checkpoint_food_reserve).execute();
+              return;
+            }
+            if (!reminder || now.timestamp < id(reserve_last_warning) ||
+                now.timestamp - id(reserve_last_warning) < 86400) return;
+          }
+          // Offline checks leave the warning due for the next connection.
+          // State subscribers are normally HA; this is not a delivery receipt.
+          if (!id(food_warning_connection_ready).state) return;
+          id(reserve_warning_sent) = true;
+          id(reserve_last_warning) = now.is_valid() ? now.timestamp : 0;
+          id(checkpoint_food_reserve).execute();
+          id(food_reserve_event).trigger("food_refill_needed");
+
+  - id: checkpoint_food_reserve
+    then:
+      - lambda: |-
+          reserve_capacity->update();
+          reserve_calibration->update();
+          reserve_threshold->update();
+          reserve_remaining->update();
+          reserve_total->update();
+          reserve_since_refill->update();
+          reserve_known->update();
+          reserve_threshold_initialized->update();
+          reserve_warning_sent->update();
+          reserve_last_warning->update();
+          if (!esphome::global_preferences->sync())
+            id(food_tracking_command).publish_state("Storage save failed; check device logs");
+
+  - id: food_change
+    parameters:
+      operation: string
+      amount: float
+    then:
+      - lambda: |-
+          const char *error = nullptr;
+          if (id(feed_active)) error = "Feeding in progress; try again afterwards";
+          else if (!std::isfinite(amount)) error = "Enter a finite amount";
+          else if (operation == "capacity") {
+            if (amount <= 0 || amount > 10000 ||
+                (id(reserve_known) && amount < id(reserve_remaining)) ||
+                amount < id(reserve_threshold))
+              error = "Capacity must cover reserve and threshold, up to 10000 g";
+            else {
+              id(reserve_capacity) = amount;
+              if (!id(reserve_threshold_initialized)) {
+                id(reserve_threshold) = amount * 0.2f;
+                id(reserve_threshold_initialized) = true;
+              }
+            }
+          } else if (operation == "calibration") {
+            if (amount <= 0 || amount > 100) error = "Calibration must be above 0 and at most 100 g";
+            else id(reserve_calibration) = amount;
+          } else if (id(reserve_capacity) <= 0) error = "Configure capacity first";
+          else if (operation == "threshold") {
+            if (amount < 0 || amount > id(reserve_capacity)) error = "Threshold must be between zero and capacity";
+            else {
+              id(reserve_threshold) = amount;
+              id(reserve_threshold_initialized) = true;
+            }
+          } else if (id(reserve_calibration) <= 0) error = "Configure grams per portion first";
+          else if (operation == "refill") {
+            id(reserve_remaining) = id(reserve_capacity);
+            id(reserve_known) = true;
+            id(reserve_since_refill) = 0;
+          } else if (operation == "topup") {
+            if (!id(reserve_known)) error = "Record a full refill before topping up";
+            else if (amount <= 0 || amount > id(reserve_capacity) - id(reserve_remaining))
+              error = "Top-up must be positive and fit within capacity";
+            else id(reserve_remaining) += amount;
+          } else error = "Unknown food command";
+          id(food_tracking_command).publish_state(error ? error : "Accepted");
+          if (!error) id(checkpoint_food_reserve).execute();
+      - script.execute: publish_food_reserve
+
+  - id: publish_food_reserve
+    mode: restart
+    then:
+      - lambda: |-
+          id(food_capacity).publish_state(id(reserve_capacity));
+          id(grams_per_portion).publish_state(id(reserve_calibration));
+          id(low_food_threshold).publish_state(id(reserve_threshold));
+          id(estimated_food_remaining).publish_state((id(reserve_known) ? id(reserve_remaining) : NAN));
+          id(total_tracked_consumption).publish_state(id(reserve_total));
+          id(consumption_since_full_refill).publish_state(id(reserve_since_refill));
+          id(food_tracking_status).publish_state((id(reserve_capacity) <= 0 || id(reserve_calibration) <= 0 ? "Setup needed" : !id(reserve_known) ? "Reserve unknown" : id(reserve_remaining) <= id(reserve_threshold) ? "Low food" : "Tracking"));
+          id(food_reserve_low).publish_state((id(reserve_known) && id(reserve_capacity) > 0 && id(reserve_calibration) > 0 && id(reserve_remaining) <= id(reserve_threshold)));
+          id(food_reserve_ready).publish_state((id(reserve_known) && id(reserve_capacity) > 0 && id(reserve_calibration) > 0));
+      - script.execute:
+          id: check_food_warning
+          reminder: false
+
   - id: play_rtttl
     parameters:
       song_str: string
@@ -283,6 +462,7 @@ script:
           then:
             - lambda: |-
                 id(feed_active) = true;
+                id(feed_calibration) = id(reserve_calibration);
                 id(target_scoops) = scoops;
                 id(scoops_count) = 0;
                 id(food_sensor_count) = 0;
@@ -341,6 +521,7 @@ script:
           else:
             - lambda: |-
                 id(feed_active) = false;
+
                 id(last_dispensed_scoops) = id(scoops_count);
                 id(last_food_sensor_count) = id(food_sensor_count);
                 id(persisted_feeder_state) = "Jammed";
@@ -530,6 +711,7 @@ interval:
   - interval: 1s
     then:
       - script.execute: update_status_led
+      - script.execute: publish_food_reserve
 
   - interval: 10min
     then:
@@ -540,6 +722,31 @@ interval:
       - script.execute: sync_rtc_from_sntp
 
 binary_sensor:
+  - platform: template
+    id: food_warning_connection_ready
+    internal: true
+    lambda: return id(feeder_api).is_connected_with_state_subscription();
+    filters:
+      - delayed_on: 10s
+    on_press:
+      - script.execute:
+          id: check_food_warning
+          reminder: true
+
+  - platform: template
+    id: food_reserve_ready
+    name: Food Reserve Ready
+    entity_category: diagnostic
+    lambda: |-
+      return (id(reserve_known) && id(reserve_capacity) > 0 && id(reserve_calibration) > 0);
+
+  - platform: template
+    id: food_reserve_low
+    name: Food Reserve Low
+    device_class: problem
+    lambda: |-
+      return (id(reserve_known) && id(reserve_capacity) > 0 && id(reserve_calibration) > 0 && id(reserve_remaining) <= id(reserve_threshold));
+
   # Physical controls and production inputs
   - platform: gpio
     name: Manual Feed Button
@@ -586,10 +793,20 @@ binary_sensor:
             id(last_motor_pulse_ms) = now;
 
             id(scoops_count) += 1;
+            // Count only accepted mechanical portions, including dry portions.
+            if (id(feed_calibration) > 0) {
+              id(reserve_total) += id(feed_calibration);
+              id(reserve_since_refill) += id(feed_calibration);
+              if (id(reserve_known))
+                id(reserve_remaining) = std::max(0.0f, id(reserve_remaining) - id(feed_calibration));
+              id(checkpoint_food_reserve).execute();
+            }
+            id(publish_food_reserve).execute();
             if (id(scoops_count) >= id(target_scoops)) {
               id(dispense_watchdog).stop();
               id(feed_forward).turn_off();
               id(feed_active) = false;
+
               id(last_dispensed_scoops) = id(scoops_count);
               id(last_food_sensor_count) = id(food_sensor_count);
               id(jam_retry_count) = 0;
@@ -599,7 +816,9 @@ binary_sensor:
               id(food_state).publish_state(id(persisted_food_state));
               id(last_feed_portions).publish_state(id(last_dispensed_scoops));
               id(food_drop_pulses).publish_state(id(last_food_sensor_count));
-              id(play_rtttl)->execute("${sound_feed_done}");
+              // Completion at/below threshold uses a distinct, mute-aware tune.
+              id(play_rtttl)->execute(id(food_reserve_low).state ?
+                  "${sound_feed_low_food}" : "${sound_feed_done}");
               id(feeder_event).trigger("feed_completed");
             }
 
@@ -660,6 +879,68 @@ binary_sensor:
               return x ? "Battery" : "DC";
 
 number:
+  - platform: template
+    id: food_top_up_amount
+    name: Food Top Up Amount
+    unit_of_measurement: g
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    optimistic: true
+    initial_value: 0
+
+  - platform: template
+    id: food_capacity
+    name: Food Capacity
+    entity_category: config
+    unit_of_measurement: g
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    update_interval: 1s
+    lambda: return id(reserve_capacity);
+    set_action:
+      - script.execute:
+          id: food_change
+          operation: capacity
+          amount: !lambda return x;
+
+  - platform: template
+    id: grams_per_portion
+    name: Grams Per Portion
+    entity_category: config
+    unit_of_measurement: g
+    min_value: 0
+    max_value: 100
+    step: 0.01
+    mode: box
+    update_interval: 1s
+    lambda: return id(reserve_calibration);
+    set_action:
+      - script.execute:
+          id: food_change
+          operation: calibration
+          amount: !lambda return x;
+
+  - platform: template
+    id: low_food_threshold
+    name: Low Food Threshold
+    entity_category: config
+    unit_of_measurement: g
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    update_interval: 1s
+    lambda: return id(reserve_threshold);
+    set_action:
+      - script.execute:
+          id: food_change
+          operation: threshold
+          amount: !lambda return x;
+
   - platform: template
     id: manual_dispense_scoops
     name: Feed Portions
@@ -759,6 +1040,32 @@ switch:
 
 sensor:
   - platform: template
+    id: estimated_food_remaining
+    name: Estimated Food Remaining
+    unit_of_measurement: g
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      return (id(reserve_known) ? id(reserve_remaining) : NAN);
+
+  - platform: template
+    id: total_tracked_consumption
+    name: Total Tracked Consumption
+    unit_of_measurement: g
+    accuracy_decimals: 1
+    state_class: total_increasing
+    update_interval: never
+    lambda: return id(reserve_total);
+
+  - platform: template
+    id: consumption_since_full_refill
+    name: Consumption Since Full Refill
+    unit_of_measurement: g
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: return id(reserve_since_refill);
+
+  - platform: template
     id: last_feed_portions
     name: Last Feed Portions
     icon: mdi:cup
@@ -843,6 +1150,18 @@ sensor:
 
 text_sensor:
   - platform: template
+    id: food_tracking_status
+    name: Food Tracking Status
+    update_interval: never
+    lambda: |-
+      return {(id(reserve_capacity) <= 0 || id(reserve_calibration) <= 0 ? "Setup needed" : !id(reserve_known) ? "Reserve unknown" : id(reserve_remaining) <= id(reserve_threshold) ? "Low food" : "Tracking")};
+
+  - platform: template
+    id: food_tracking_command
+    name: Food Tracking Command
+    entity_category: diagnostic
+
+  - platform: template
     id: feeder_state
     name: Feeder State
     icon: mdi:state-machine
@@ -889,6 +1208,28 @@ text_sensor:
     entity_category: diagnostic
 
 button:
+  - platform: template
+    id: food_record_top_up
+    name: Food Record Top Up
+    icon: mdi:food
+    on_press:
+      then:
+        - script.execute:
+            id: food_change
+            operation: topup
+            amount: !lambda return id(food_top_up_amount).state;
+
+  - platform: template
+    id: food_full_refill
+    name: Food Full Refill
+    icon: mdi:food
+    on_press:
+      then:
+        - script.execute:
+            id: food_change
+            operation: refill
+            amount: !lambda return 0;
+
   - platform: factory_reset
     id: factory_reset_button
     internal: true

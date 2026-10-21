@@ -6,7 +6,14 @@ PETKIT Fresh Element Solo feeder, model D4-2 / product code P570.
 This is an independent community project. It is not affiliated with or endorsed
 by PETKIT.
 
-Current release: `v1.2.0`
+Current release: `v2.0.0`
+
+Version 2.0.0 includes device-owned food tracking and refill alerts.
+Both feeders are configured; the update preserved their food settings and reserves.
+Tracking and refill reminder timing run on the device using native ESPHome
+globals, scripts, the RTC and event entities. Home Assistant forwards refill events.
+See [food reserve setup and operation](docs/food-reserve.md)
+for calibration, refill controls, consolidated alerts, persistence limits, and rollout checks.
 
 ## What This Project Provides
 
@@ -22,6 +29,9 @@ Current project outcomes:
 - Feed completion events for completed, jammed, and rejected feed attempts.
 - Home Assistant scheduling and supervision through a reusable blueprint.
 - Food-drop pulse monitoring with a persistent Food State surface.
+- Device-owned estimated reserve in grams, calibrated consumption totals,
+  full refills and partial top-ups.
+- Consolidated refill warnings, Brisbane 09:00 reminders, and reconnect recovery.
 - Feeder State, Last Feed Portions, Food Drop Pulses, Battery Pack Voltage,
   Battery Pack Level, DC Input Voltage, Battery Power Active, and diagnostic
   restart information.
@@ -36,7 +46,7 @@ Current project outcomes:
 The reusable ESPHome package is:
 
 ```text
-github://projectcobalt/petkit-element-solo/petkit-element-solo.yaml@main
+github://projectcobalt/petkit-element-solo/petkit-element-solo.yaml@v2.0.0
 ```
 
 Raw configuration URL:
@@ -75,6 +85,8 @@ It can notify for:
 - Completed dry runs where no food-drop pulses were detected.
 - Power-source warnings and low battery voltage.
 - Optional successful feed confirmation.
+- Device-owned low-food events and RTC-timed daily reminders, forwarded by HA.
+- A distinct low-food completion tune that respects Mute Sounds.
 
 [Import the blueprint into Home Assistant](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fprojectcobalt%2Fpetkit-element-solo%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Felement-solo-feeding.yaml)
 
@@ -99,8 +111,8 @@ supervise feeding without relying on the original PETKIT cloud behavior.
 - Flashing this firmware replaces the original PETKIT firmware.
 - Confirm your hardware matches the supported Element Solo model before
   flashing.
-- Low-food detection is currently based on food-drop pulses during feeding; a
-  calibrated hopper-level model is future work.
+- Estimated reserve is calculated from calibrated mechanical portions and recorded
+  food changes. Food-drop pulses remain a separate delivery check, not a mass sensor.
 - Deep sleep is prepared but not automatically entered yet; scheduling a safe
   sleep policy remains future work.
 - Food-drop verification requires the Food Drop Pulses entity to be enabled in
