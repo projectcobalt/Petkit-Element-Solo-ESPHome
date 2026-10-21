@@ -9,7 +9,6 @@ by PETKIT.
 Current release: `v2.0.0`
 
 Version 2.0.0 includes device-owned food tracking and refill alerts.
-Both feeders are configured; the update preserved their food settings and reserves.
 Tracking and refill reminder timing run on the device using native ESPHome
 globals, scripts, the RTC and event entities. Home Assistant forwards refill events.
 See [food reserve setup and operation](docs/food-reserve.md)
@@ -46,13 +45,13 @@ Current project outcomes:
 The reusable ESPHome package is:
 
 ```text
-github://projectcobalt/petkit-element-solo/petkit-element-solo.yaml@v2.0.0
+github://projectcobalt/Petkit-Element-Solo-ESPHome/petkit-element-solo.yaml@v2.0.0
 ```
 
 Raw configuration URL:
 
 ```text
-https://raw.githubusercontent.com/projectcobalt/petkit-element-solo/main/petkit-element-solo.yaml
+https://raw.githubusercontent.com/projectcobalt/Petkit-Element-Solo-ESPHome/main/petkit-element-solo.yaml
 ```
 
 After flashing and provisioning, use **Take Control** in the ESPHome dashboard.
@@ -88,7 +87,7 @@ It can notify for:
 - Device-owned low-food events and RTC-timed daily reminders, forwarded by HA.
 - A distinct low-food completion tune that respects Mute Sounds.
 
-[Import the blueprint into Home Assistant](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fprojectcobalt%2Fpetkit-element-solo%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Felement-solo-feeding.yaml)
+[Import the blueprint into Home Assistant](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fprojectcobalt%2FPetkit-Element-Solo-ESPHome%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Felement-solo-feeding.yaml)
 
 ## Hardware Findings
 
